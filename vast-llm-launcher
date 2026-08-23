@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -u
+
+# Lightweight interactive launcher for Vast LLM Manager.
+# The core manager intentionally stays free of UI effects so it remains
+# predictable in scripts, cron jobs and CI.
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CORE="${VAST_LLM_CORE:-/usr/local/lib/vast-llm/vast-llm-core}"
+
+if [[ ! -x "$CORE" ]]; then
+  # Developer / cloned-repo fallback.
+  if [[ -x "$SELF_DIR/vast-llm" ]]; then
+    CORE="$SELF_DIR/vast-llm"
+  else
+    printf 'ERROR: vast-llm core not found. Re-run install.sh.\n' >&2
+    exit 1
+  fi
+fi
+
+sleep_tiny() {
+  # sleep accepts fractional seconds on GNU coreutils; silently skip if not.
+  sleep "$1" 2>/dev/null || true
+}
+
+splash_enabled() {
+  [[ "${VAST_LLM_NO_SPLASH:-0}" != "1" ]] || return 1
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-dumb}" != "dumb" ]] || return 1
+  return 0
+}
+
+show_splash() {
+  local reset='\033[0m'
+  local bold='\033[1m'
+  local cyan='\033[38;5;51m'
+  local blue='\033[38;5;39m'
+  local violet='\033[38;5;141m'
+  local dim='\033[2m'
+  local green='\033[38;5;82m'
+
+  if [[ -n "${NO_COLOR:-}" ]]; then
+    reset=''; bold=''; cyan=''; blue=''; violet=''; dim=''; green=''
+  fi
+
+  # Hide cursor only for the short animation and always restore it.
+  printf '\033[?25l'
+  trap 'printf "\033[?25h"' EXIT INT TERM
+
+  clear 2>/dev/null || printf '\n'
+
+  local -a art=(
+'██╗   ██╗ █████╗ ███████╗████████╗      ██╗     ██╗     ███╗   ███╗'
+'██║   ██║██╔══██╗██╔════╝╚══██╔══╝      ██║     ██║     ████╗ ████║'
+'██║   ██║███████║███████╗   ██║         ██║     ██║     ██╔████╔██║'
+'╚██╗ ██╔╝██╔══██║╚════██║   ██║         ██║     ██║     ██║╚██╔╝██║'
+' ╚████╔╝ ██║  ██║███████║   ██║         ███████╗███████╗██║ ╚═╝ ██║'
+'  ╚═══╝  ╚═╝  ╚═╝╚══════╝   ╚═╝         ╚══════╝╚══════╝╚═╝     ╚═╝'
+  )
+
+  local i
+  for ((i = 0; i < ${#art[@]}; i++)); do
+    case $((i % 3)) in
+      0) printf '%b%b%s%b\n' "$bold" "$cyan" "${art[$i]}" "$reset" ;;
+      1) printf '%b%b%s%b\n' "$bold" "$blue" "${art[$i]}" "$reset" ;;
+      2) printf '%b%b%s%b\n' "$bold" "$violet" "${art[$i]}" "$reset" ;;
+    esac
+    sleep_tiny "${VAST_LLM_SPLASH_SPEED:-0.025}"
+  done
+
+  printf '\n%b      Vast.ai GPU inference control plane%b\n' "$dim" "$reset"
+  printf '%b      profiles • GGUF • context • MTP • multi-GPU%b\n\n' "$dim" "$reset"
+
+  local -a frames=('◐' '◓' '◑' '◒')
+  local -a stages=('Detecting CUDA' 'Reading profiles' 'Preparing runtime' 'Ready')
+  for ((i = 0; i < ${#stages[@]}; i++)); do
+    printf '\r%b%s%b  %-20s' "$cyan" "${frames[$i]}" "$reset" "${stages[$i]}"
+    sleep_tiny "${VAST_LLM_SPLASH_STAGE_SPEED:-0.075}"
+  done
+  printf '\r%b✓%b  %-20s\n\n' "$green" "$reset" 'Control plane online'
+
+  printf '\033[?25h'
+  trap - EXIT INT TERM
+}
+
+if splash_enabled; then
+  show_splash
+fi
+
+exec "$CORE" "$@"
