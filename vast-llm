@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="vast-llm"
+STATE_DIR="${VAST_LLM_STATE_DIR:-/data/vast-llm}"
+PROFILES_DIR="$STATE_DIR/profiles"
+LOG_DIR="$STATE_DIR/logs"
+PID_DIR="$STATE_DIR/pids"
+MODEL_DIR="${VAST_LLM_MODEL_DIR:-/data/models}"
+HF_HOME_DIR="${HF_HOME:-/data/huggingface}"
+HF_VENV="${VAST_LLM_HF_VENV:-/opt/hfenv}"
+CURRENT_FILE="$STATE_DIR/current_profile"
+API_KEY_FILE="$STATE_DIR/api_key.txt"
+
+mkdir -p "$PROFILES_DIR" "$LOG_DIR" "$PID_DIR" "$MODEL_DIR" "$HF_HOME_DIR"
+
+export HF_HOME="$HF_HOME_DIR"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+export LD_LIBRARY_PATH="/app:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+
+c_reset='\033[0m'; c_bold='\033[1m'; c_green='\033[32m'; c_yellow='\033[33m'; c_red='\033[31m'; c_cyan='\033[36m'
+info() { printf "%b%s%b\n" "$c_cyan" "$*" "$c_reset"; }
+ok() { printf "%b%s%b\n" "$c_green" "$*" "$c_reset"; }
+warn() { printf "%b%s%b\n" "$c_yellow" "$*" "$c_reset" >&2; }
+die() { printf "%bERROR: %s%b\n" "$c_red" "$*" "$c_reset" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Vast.ai LLM Wizard / Manager
+
+Usage:
+  vast-llm wizard [profile]      Create or edit a profile interactively
+  vast-llm use <profile>         Make a profile current
+  vast-llm profiles              List saved profiles
+  vast-llm show [profile]        Show resolved profile configuration
+  vast-llm download [profile]    Download the profile model from Hugging Face
+  vast-llm start [profile]       Start one replica per configured GPU
+  vast-llm stop [profile]        Stop managed replicas
+  vast-llm restart [profile]     Restart managed replicas
+  vast-llm status [profile]      Show processes, health and GPU state
+  vast-llm logs [index]          Follow logs (default: all current replicas)
+  vast-llm benchmark [index]     Run a short OpenAI-compatible speed benchmark
+  vast-llm key                   Print the local API key
+  vast-llm doctor                Check llama.cpp, CUDA and dependencies
+  vast-llm menu                  Interactive menu
+  vast-llm help
+
+Profiles persist in /data/vast-llm/profiles by default.
+Models persist in /data/models by default.
+EOF
+}
+
+prompt() {
+  local label="$1" default="${2:-}" value
+  if [[ -n "$default" ]]; then
+    read -r -p "$label [$default]: " value || true
+    printf '%s' "${value:-$default}"
+  else
+    read -r -p "$label: " value || true
+    printf '%s' "$value"
+  fi
+}
+
+prompt_yes_no() {
+  local label="$1" default="${2:-y}" answer
+  local hint='y/N'; [[ "$default" == "y" ]] && hint='Y/n'
+  read -r -p "$label [$hint]: " answer || true
+  answer="${answer:-$default}"
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+sanitize_profile_name() {
+  local n="$1"
+  [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid profile name '$n'. Use letters, digits, dot, underscore or dash."
+  printf '%s' "$n"
+}
+
+profile_path() { printf '%s/%s.env' "$PROFILES_DIR" "$(sanitize_profile_name "$1")"; }
+
+current_profile() {
+  if [[ -s "$CURRENT_FILE" ]]; then cat "$CURRENT_FILE"; else printf 'default'; fi
+}
+
+resolve_profile() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || p="$(current_profile)"
+  printf '%s' "$(sanitize_profile_name "$p")"
+}
+
+ensure_api_key() {
+  if [[ ! -s "$API_KEY_FILE" ]]; then
+    umask 077
+    openssl rand -hex 32 > "$API_KEY_FILE"
+  fi
+}
+
+find_llama_server() {
+  if [[ -n "${LLAMA_SERVER:-}" && -x "${LLAMA_SERVER}" ]]; then printf '%s' "$LLAMA_SERVER"; return; fi
+  if command -v llama-server >/dev/null 2>&1; then command -v llama-server; return; fi
+  if [[ -x /app/llama-server ]]; then printf '/app/llama-server'; return; fi
+  local found
+  found="$(find /app /usr/local/bin /opt -maxdepth 4 -type f -name llama-server -perm -111 2>/dev/null | head -n1 || true)"
+  [[ -n "$found" ]] || return 1
+  printf '%s' "$found"
+}
+
+ensure_hf_cli() {
+  if [[ -x "$HF_VENV/bin/hf" ]]; then return; fi
+  info "Installing Hugging Face downloader in $HF_VENV ..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv ca-certificates >/dev/null
+  fi
+  python3 -m venv "$HF_VENV"
+  "$HF_VENV/bin/pip" install -q -U pip huggingface_hub hf_xet
+}
+
+default_profile() {
+  cat <<'EOF'
+MODEL_REPO="0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF"
+MODEL_FILE="RVN-Q4_K_M-multilingual-mtp.gguf"
+ALIAS_BASE="qwen-heretic"
+GPU_IDS="0,1"
+PORT_BASE="8000"
+CONTEXT="65536"
+PARALLEL="1"
+GPU_LAYERS="99"
+FLASH_ATTN="on"
+CACHE_K="q4_0"
+CACHE_V="q4_0"
+MTP_ENABLED="1"
+MTP_DRAFT_MAX="4"
+MTP_P_MIN="0.65"
+REASONING_MODE="default"
+REASONING_BUDGET=""
+JINJA="1"
+NO_MMPROJ="1"
+CACHE_REUSE="0"
+HOST="127.0.0.1"
+EXTRA_ARGS=""
+EOF
+}
+
+load_profile() {
+  local p="$1" f
+  f="$(profile_path "$p")"
+  [[ -f "$f" ]] || die "Profile '$p' does not exist. Run: vast-llm wizard $p"
+
+  # shellcheck disable=SC1090
+  source <(default_profile)
+  # shellcheck disable=SC1090
+  source "$f"
+
+  : "${MODEL_REPO:?MODEL_REPO missing}"
+  : "${MODEL_FILE:?MODEL_FILE missing}"
+  : "${ALIAS_BASE:?ALIAS_BASE missing}"
+  : "${GPU_IDS:?GPU_IDS missing}"
+  : "${PORT_BASE:?PORT_BASE missing}"
+  : "${CONTEXT:?CONTEXT missing}"
+}
+
+write_profile() {
+  local p="$1" f
+  f="$(profile_path "$p")"
+  umask 077
+  cat > "$f" <<EOF
+MODEL_REPO=$(printf '%q' "$MODEL_REPO")
+MODEL_FILE=$(printf '%q' "$MODEL_FILE")
+ALIAS_BASE=$(printf '%q' "$ALIAS_BASE")
+GPU_IDS=$(printf '%q' "$GPU_IDS")
+PORT_BASE=$(printf '%q' "$PORT_BASE")
+CONTEXT=$(printf '%q' "$CONTEXT")
+PARALLEL=$(printf '%q' "$PARALLEL")
+GPU_LAYERS=$(printf '%q' "$GPU_LAYERS")
+FLASH_ATTN=$(printf '%q' "$FLASH_ATTN")
+CACHE_K=$(printf '%q' "$CACHE_K")
+CACHE_V=$(printf '%q' "$CACHE_V")
+MTP_ENABLED=$(printf '%q' "$MTP_ENABLED")
+MTP_DRAFT_MAX=$(printf '%q' "$MTP_DRAFT_MAX")
+MTP_P_MIN=$(printf '%q' "$MTP_P_MIN")
+REASONING_MODE=$(printf '%q' "$REASONING_MODE")
+REASONING_BUDGET=$(printf '%q' "$REASONING_BUDGET")
+JINJA=$(printf '%q' "$JINJA")
+NO_MMPROJ=$(printf '%q' "$NO_MMPROJ")
+CACHE_REUSE=$(printf '%q' "$CACHE_REUSE")
+HOST=$(printf '%q' "$HOST")
+EXTRA_ARGS=$(printf '%q' "$EXTRA_ARGS")
+EOF
+}
+
+cmd_wizard() {
+  local p="$(resolve_profile "${1:-}")" f
+  f="$(profile_path "$p")"
+
+  # defaults
+  source <(default_profile)
+  if [[ -f "$f" ]]; then
+    # shellcheck disable=SC1090
+    source "$f"
+    info "Editing profile '$p'"
+  else
+    info "Creating profile '$p'"
+  fi
+
+  echo
+  MODEL_REPO="$(prompt 'Hugging Face repository' "$MODEL_REPO")"
+  MODEL_FILE="$(prompt 'GGUF filename' "$MODEL_FILE")"
+  ALIAS_BASE="$(prompt 'Model alias base' "$ALIAS_BASE")"
+  echo
+  GPU_IDS="$(prompt 'GPU IDs for independent replicas (comma separated)' "$GPU_IDS")"
+  PORT_BASE="$(prompt 'First API port' "$PORT_BASE")"
+  CONTEXT="$(prompt 'Context size' "$CONTEXT")"
+  PARALLEL="$(prompt 'Parallel slots per replica' "$PARALLEL")"
+  GPU_LAYERS="$(prompt 'GPU layers (-ngl)' "$GPU_LAYERS")"
+  echo
+  FLASH_ATTN="$(prompt 'Flash attention (on/off/auto)' "$FLASH_ATTN")"
+  CACHE_K="$(prompt 'KV cache K type' "$CACHE_K")"
+  CACHE_V="$(prompt 'KV cache V type' "$CACHE_V")"
+  CACHE_REUSE="$(prompt 'Cache reuse chunk size (0 disables)' "$CACHE_REUSE")"
+  echo
+  if prompt_yes_no 'Enable MTP speculative decoding?' "$([[ "$MTP_ENABLED" == 1 ]] && echo y || echo n)"; then MTP_ENABLED=1; else MTP_ENABLED=0; fi
+  if [[ "$MTP_ENABLED" == 1 ]]; then
+    MTP_DRAFT_MAX="$(prompt 'MTP max drafted tokens' "$MTP_DRAFT_MAX")"
+    MTP_P_MIN="$(prompt 'MTP minimum draft probability' "$MTP_P_MIN")"
+  fi
+  echo
+  REASONING_MODE="$(prompt 'Reasoning mode (default/on/off)' "$REASONING_MODE")"
+  REASONING_BUDGET="$(prompt 'Reasoning budget (blank = server default)' "$REASONING_BUDGET")"
+  if prompt_yes_no 'Enable Jinja chat template?' "$([[ "$JINJA" == 1 ]] && echo y || echo n)"; then JINJA=1; else JINJA=0; fi
+  if prompt_yes_no 'Disable mmproj?' "$([[ "$NO_MMPROJ" == 1 ]] && echo y || echo n)"; then NO_MMPROJ=1; else NO_MMPROJ=0; fi
+  HOST="$(prompt 'Bind host' "$HOST")"
+  EXTRA_ARGS="$(prompt 'Extra llama-server args (optional)' "$EXTRA_ARGS")"
+
+  write_profile "$p"
+  printf '%s\n' "$p" > "$CURRENT_FILE"
+  ok "Saved profile '$p' and made it current."
+  echo
+  cmd_show "$p"
+
+  if prompt_yes_no 'Download the model now?' y; then cmd_download "$p"; fi
+  if prompt_yes_no 'Start the server replicas now?' y; then cmd_start "$p"; fi
+}
+
+cmd_profiles() {
+  local cur="$(current_profile)" f any=0
+  printf '%-3s %-24s %-10s %-12s %s\n' '' 'PROFILE' 'CONTEXT' 'GPUS' 'MODEL'
+  for f in "$PROFILES_DIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    any=1
+    local p="$(basename "$f" .env)"
+    source <(default_profile)
+    # shellcheck disable=SC1090
+    source "$f"
+    local mark=' '; [[ "$p" == "$cur" ]] && mark='*'
+    printf '%-3s %-24s %-10s %-12s %s/%s\n' "$mark" "$p" "$CONTEXT" "$GPU_IDS" "$MODEL_REPO" "$MODEL_FILE"
+  done
+  [[ "$any" == 1 ]] || echo "No profiles. Run: vast-llm wizard default"
+}
+
+cmd_use() {
+  local p="$(resolve_profile "${1:-}")"
+  [[ -f "$(profile_path "$p")" ]] || die "Unknown profile '$p'"
+  printf '%s\n' "$p" > "$CURRENT_FILE"
+  ok "Current profile: $p"
+}
+
+cmd_show() {
+  local p="$(resolve_profile "${1:-}")"
+  load_profile "$p"
+  cat <<EOF
+Profile:          $p
+Model repo:       $MODEL_REPO
+Model file:       $MODEL_FILE
+Model path:       $MODEL_DIR/$MODEL_FILE
+Alias base:       $ALIAS_BASE
+GPU replicas:     $GPU_IDS
+Port base:        $PORT_BASE
+Context:          $CONTEXT
+Parallel slots:   $PARALLEL
+GPU layers:       $GPU_LAYERS
+Flash attention:  $FLASH_ATTN
+KV cache:         K=$CACHE_K V=$CACHE_V
+Cache reuse:      $CACHE_REUSE
+MTP:              $MTP_ENABLED (draft=$MTP_DRAFT_MAX p-min=$MTP_P_MIN)
+Reasoning:        $REASONING_MODE budget=${REASONING_BUDGET:-default}
+Host:             $HOST
+Extra args:       ${EXTRA_ARGS:-none}
+EOF
+}
+
+cmd_download() {
+  local p="$(resolve_profile "${1:-}")"
+  load_profile "$p"
+  local target="$MODEL_DIR/$MODEL_FILE"
+  if [[ -s "$target" ]]; then
+    ok "Model already exists: $target ($(du -h "$target" | awk '{print $1}'))"
+    return
+  fi
+  ensure_hf_cli
+  info "Downloading $MODEL_REPO :: $MODEL_FILE"
+  mkdir -p "$MODEL_DIR"
+  "$HF_VENV/bin/hf" download "$MODEL_REPO" "$MODEL_FILE" --local-dir "$MODEL_DIR"
+  [[ -s "$target" ]] || die "Download completed but $target was not found"
+  ok "Downloaded: $target"
+}
+
+build_server_args() {
+  SERVER_ARGS=(
+    -m "$MODEL_DIR/$MODEL_FILE"
+    --host "$HOST"
+    -ngl "$GPU_LAYERS"
+    -c "$CONTEXT"
+    --parallel "$PARALLEL"
+    --flash-attn "$FLASH_ATTN"
+    --cache-type-k "$CACHE_K"
+    --cache-type-v "$CACHE_V"
+  )
+  [[ "$MTP_ENABLED" == 1 ]] && SERVER_ARGS+=(--spec-type draft-mtp --spec-draft-n-max "$MTP_DRAFT_MAX" --spec-draft-p-min "$MTP_P_MIN")
+  [[ "$JINJA" == 1 ]] && SERVER_ARGS+=(--jinja)
+  [[ "$NO_MMPROJ" == 1 ]] && SERVER_ARGS+=(--no-mmproj)
+  [[ "$CACHE_REUSE" != 0 && -n "$CACHE_REUSE" ]] && SERVER_ARGS+=(--cache-reuse "$CACHE_REUSE")
+  [[ "$REASONING_MODE" != default && -n "$REASONING_MODE" ]] && SERVER_ARGS+=(--reasoning "$REASONING_MODE")
+  [[ -n "$REASONING_BUDGET" ]] && SERVER_ARGS+=(--reasoning-budget "$REASONING_BUDGET")
+  if [[ -n "$EXTRA_ARGS" ]]; then
+    # shellcheck disable=SC2206
+    local extras=( $EXTRA_ARGS )
+    SERVER_ARGS+=("${extras[@]}")
+  fi
+}
+
+profile_pid_glob() { printf '%s/%s-' "$PID_DIR" "$1"; }
+
+cmd_start() {
+  local p="$(resolve_profile "${1:-}")"
+  load_profile "$p"
+  ensure_api_key
+  cmd_download "$p"
+
+  local server
+  server="$(find_llama_server)" || die "llama-server not found. Use a llama.cpp server CUDA image or set LLAMA_SERVER=/path/to/llama-server"
+  if ldd "$server" 2>/dev/null | grep -q 'not found'; then
+    ldd "$server" | grep 'not found' >&2
+    die "llama-server has missing shared libraries. LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+  fi
+
+  cmd_stop "$p" --quiet || true
+
+  IFS=',' read -r -a gpus <<< "$GPU_IDS"
+  local idx=0 api_key
+  api_key="$(cat "$API_KEY_FILE")"
+  for raw_gpu in "${gpus[@]}"; do
+    local gpu="${raw_gpu//[[:space:]]/}" port alias log pidfile
+    [[ -n "$gpu" ]] || continue
+    port=$((PORT_BASE + idx))
+    if (( ${#gpus[@]} == 1 )); then alias="$ALIAS_BASE"; else alias="${ALIAS_BASE}-${idx}"; fi
+    log="$LOG_DIR/${p}-${idx}.log"
+    pidfile="$PID_DIR/${p}-${idx}.pid"
+    build_server_args
+
+    info "Starting replica $idx: GPU $gpu -> $HOST:$port alias=$alias context=$CONTEXT"
+    CUDA_VISIBLE_DEVICES="$gpu" nohup "$server" \
+      "${SERVER_ARGS[@]}" \
+      --alias "$alias" \
+      --port "$port" \
+      --api-key "$api_key" \
+      > "$log" 2>&1 &
+    echo $! > "$pidfile"
+    idx=$((idx + 1))
+  done
+
+  (( idx > 0 )) || die "No valid GPUs configured"
+  printf '%s\n' "$p" > "$CURRENT_FILE"
+
+  info "Waiting for replicas to become ready..."
+  local i
+  for ((i=0; i<idx; i++)); do
+    wait_health "$p" "$i" 120 || {
+      warn "Replica $i did not become healthy. Last log lines:"
+      tail -n 30 "$LOG_DIR/${p}-${i}.log" >&2 || true
+    }
+  done
+  cmd_status "$p"
+}
+
+wait_health() {
+  local p="$1" idx="$2" tries="${3:-60}"
+  load_profile "$p"
+  local port=$((PORT_BASE + idx)) n status
+  for ((n=0; n<tries; n++)); do
+    status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" || true)"
+    if [[ "$status" == 200 ]]; then ok "Replica $idx ready on port $port"; return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+cmd_stop() {
+  local p="$(resolve_profile "${1:-}")" quiet="${2:-}"
+  local f stopped=0
+  for f in "$PID_DIR/${p}-"*.pid; do
+    [[ -e "$f" ]] || continue
+    local pid
+    pid="$(cat "$f" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for _ in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f "$f"
+  done
+  [[ "$quiet" == --quiet ]] || ok "Stopped $stopped managed replica(s) for '$p'."
+}
+
+cmd_restart() {
+  local p="$(resolve_profile "${1:-}")"
+  cmd_stop "$p"
+  cmd_start "$p"
+}
+
+cmd_status() {
+  local p="$(resolve_profile "${1:-}")"
+  load_profile "$p"
+  ensure_api_key
+  IFS=',' read -r -a gpus <<< "$GPU_IDS"
+  echo
+  printf '%-7s %-6s %-8s %-9s %-8s %s\n' 'REPLICA' 'GPU' 'PORT' 'PID' 'HEALTH' 'ALIAS'
+  local idx=0
+  for raw_gpu in "${gpus[@]}"; do
+    local gpu="${raw_gpu//[[:space:]]/}" port pidfile pid='-' health='down' alias
+    [[ -n "$gpu" ]] || continue
+    port=$((PORT_BASE + idx)); pidfile="$PID_DIR/${p}-${idx}.pid"
+    [[ -s "$pidfile" ]] && pid="$(cat "$pidfile")"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" || true)"
+    [[ "$code" == 200 ]] && health='ok'
+    if (( ${#gpus[@]} == 1 )); then alias="$ALIAS_BASE"; else alias="${ALIAS_BASE}-${idx}"; fi
+    printf '%-7s %-6s %-8s %-9s %-8s %s\n' "$idx" "$gpu" "$port" "$pid" "$health" "$alias"
+    idx=$((idx + 1))
+  done
+  echo
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,memory.used,memory.total,utilization.gpu --format=csv,noheader || true
+  fi
+}
+
+cmd_logs() {
+  local p="$(current_profile)" idx="${1:-}"
+  if [[ -n "$idx" ]]; then
+    tail -n 100 -f "$LOG_DIR/${p}-${idx}.log"
+  else
+    local files=("$LOG_DIR/${p}-"*.log)
+    [[ -e "${files[0]}" ]] || die "No logs found for '$p'"
+    tail -n 100 -f "${files[@]}"
+  fi
+}
+
+cmd_benchmark() {
+  local p="$(current_profile)" idx="${1:-0}"
+  load_profile "$p"
+  ensure_api_key
+  local port=$((PORT_BASE + idx)) alias api_key
+  if (( $(tr -cd ',' <<<"$GPU_IDS" | wc -c) > 0 )); then alias="${ALIAS_BASE}-${idx}"; else alias="$ALIAS_BASE"; fi
+  api_key="$(cat "$API_KEY_FILE")"
+  command -v jq >/dev/null 2>&1 || {
+    if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq >/dev/null; fi
+  }
+  info "Benchmarking replica $idx on port $port ..."
+  local result
+  result="$(curl -s "http://127.0.0.1:${port}/v1/chat/completions" \
+    -H "Authorization: Bearer $api_key" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a detailed technical explanation of transformer inference optimization. Continue for at least 400 tokens.\"}],\"max_tokens\":512,\"temperature\":0.7}")"
+  if command -v jq >/dev/null 2>&1; then
+    jq '{finish_reason:.choices[0].finish_reason, output_tokens:.usage.completion_tokens, prompt_tok_s:.timings.prompt_per_second, generation_tok_s:.timings.predicted_per_second, generation_ms:.timings.predicted_ms, mtp_drafted:.timings.draft_n, mtp_accepted:.timings.draft_n_accepted}' <<<"$result"
+  else
+    printf '%s\n' "$result"
+  fi
+}
+
+cmd_key() { ensure_api_key; cat "$API_KEY_FILE"; echo; }
+
+cmd_doctor() {
+  echo "== GPU =="
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || warn 'nvidia-smi not found'
+  echo
+  echo "== llama-server =="
+  local server
+  if server="$(find_llama_server)"; then
+    echo "Path: $server"
+    "$server" --version || true
+    if ldd "$server" 2>/dev/null | grep -q 'not found'; then
+      warn 'Missing libraries:'; ldd "$server" | grep 'not found' || true
+    else
+      ok 'Shared libraries resolved.'
+    fi
+  else
+    warn 'llama-server not found.'
+  fi
+  echo
+  echo "== Storage =="
+  df -h "$STATE_DIR" "$MODEL_DIR" 2>/dev/null || true
+  echo
+  echo "== Environment =="
+  echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+  echo "HF_HOME=$HF_HOME"
+  [[ -n "${HF_TOKEN:-}" ]] && echo 'HF_TOKEN=set' || echo 'HF_TOKEN=not set (public models still work)'
+}
+
+cmd_menu() {
+  while true; do
+    local cur="$(current_profile)"
+    echo
+    printf "%bVast.ai LLM Manager%b — current: %s\n" "$c_bold" "$c_reset" "$cur"
+    cat <<'EOF'
+  1) Status
+  2) Start
+  3) Stop
+  4) Restart
+  5) Configure current profile
+  6) Create/switch profile
+  7) Download model
+  8) Benchmark
+  9) Follow logs
+ 10) Doctor
+ 11) Show API key
+  0) Exit
+EOF
+    local choice
+    read -r -p 'Choose: ' choice
+    case "$choice" in
+      1) cmd_status "$cur" ;;
+      2) cmd_start "$cur" ;;
+      3) cmd_stop "$cur" ;;
+      4) cmd_restart "$cur" ;;
+      5) cmd_wizard "$cur" ;;
+      6)
+         cmd_profiles
+         local np
+         np="$(prompt 'Profile name')"
+         if [[ -f "$(profile_path "$np")" ]]; then cmd_use "$np"; else cmd_wizard "$np"; fi
+         ;;
+      7) cmd_download "$cur" ;;
+      8) local bi; bi="$(prompt 'Replica index' '0')"; cmd_benchmark "$bi" ;;
+      9) local li; li="$(prompt 'Replica index (blank = all)' '')"; cmd_logs "$li" ;;
+      10) cmd_doctor ;;
+      11) cmd_key ;;
+      0) return ;;
+      *) warn 'Unknown choice.' ;;
+    esac
+  done
+}
+
+main() {
+  local cmd="${1:-menu}"; shift || true
+  case "$cmd" in
+    wizard|configure|config) cmd_wizard "${1:-}" ;;
+    use) [[ $# -ge 1 ]] || die 'Usage: vast-llm use <profile>'; cmd_use "$1" ;;
+    profiles|list) cmd_profiles ;;
+    show) cmd_show "${1:-}" ;;
+    download) cmd_download "${1:-}" ;;
+    start) cmd_start "${1:-}" ;;
+    stop) cmd_stop "${1:-}" ;;
+    restart) cmd_restart "${1:-}" ;;
+    status) cmd_status "${1:-}" ;;
+    logs) cmd_logs "${1:-}" ;;
+    benchmark|bench) cmd_benchmark "${1:-0}" ;;
+    key) cmd_key ;;
+    doctor) cmd_doctor ;;
+    menu) cmd_menu ;;
+    help|-h|--help) usage ;;
+    *) usage; die "Unknown command '$cmd'" ;;
+  esac
+}
+
+main "$@"
