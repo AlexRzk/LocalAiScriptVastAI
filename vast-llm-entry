@@ -16,18 +16,24 @@ for f in "$CORE" "$UI" "$BENCH" "$DOCTOR"; do
 done
 
 activate_repaired_runtime() {
-  local server runtime_ld
+  local server runtime_ld wrapper q_server q_ld
   if [[ -s "$SERVER_PATH_FILE" ]]; then
     server="$(cat "$SERVER_PATH_FILE")"
     if [[ -x "$server" ]]; then
-      export LLAMA_SERVER="$server"
       runtime_ld=""
       [[ -s "$RUNTIME_LD_FILE" ]] && runtime_ld="$(cat "$RUNTIME_LD_FILE")"
-      if [[ -n "$runtime_ld" ]]; then
-        export LD_LIBRARY_PATH="$runtime_ld"
-      else
-        export LD_LIBRARY_PATH="$(dirname "$server")"
-      fi
+      wrapper="$STATE_DIR/runtime/llama-server-launch"
+      mkdir -p "$(dirname "$wrapper")"
+      printf -v q_server '%q' "$server"
+      printf -v q_ld '%q' "$runtime_ld"
+      cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+export LD_LIBRARY_PATH=$q_ld
+export LD_PRELOAD=
+exec $q_server "\$@"
+EOF
+      chmod 700 "$wrapper"
+      export LLAMA_SERVER="$wrapper"
       export VAST_LLM_REPAIRED_RUNTIME=1
     fi
   fi
