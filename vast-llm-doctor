@@ -66,8 +66,7 @@ host_compute_arch() {
     *RTX\ 3090*|*RTX\ 3080*|*RTX\ 3070*|*RTX\ A6000*|*A40*) printf '86' ;;
     *RTX\ 4090*|*RTX\ 4080*|*L40*|*L4*) printf '89' ;;
     *A100*) printf '80' ;;
-    *H100*) printf '90' ;;
-    *H200*) printf '90' ;;
+    *H100*|*H200*) printf '90' ;;
     *) printf 'native' ;;
   esac
 }
@@ -124,7 +123,7 @@ DIAG_SERVER=''
 DIAG_PROBE=''
 
 diagnose() {
-  local driver cuda gpu version log_errors
+  local driver cuda gpu version log_errors driver_major
   DIAG_NEEDS_FIX=0
   DIAG_REASON=''
 
@@ -196,7 +195,7 @@ diagnose() {
 
   warn "Diagnosis: $DIAG_REASON"
   if [[ -n "$driver" && "$driver" =~ ^([0-9]+)\. ]]; then
-    local driver_major="${BASH_REMATCH[1]}"
+    driver_major="${BASH_REMATCH[1]}"
     if (( driver_major < 525 )); then
       warn 'This host driver is older than the CUDA 12.x compatibility floor used by the repair.'
     elif (( driver_major < 580 )); then
@@ -219,7 +218,7 @@ install_cuda12_toolkit() {
   command -v apt-get >/dev/null 2>&1 || { fail 'apt-get is unavailable; cannot install a CUDA 12 toolkit automatically.'; return 1; }
   [[ "$(id -u)" == 0 ]] || { fail 'Automatic CUDA toolkit installation requires root on the Vast instance.'; return 1; }
 
-  info 'Installing build dependencies...'
+  info 'Installing build dependencies...' >&2
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git cmake build-essential ca-certificates >/dev/null
 
@@ -227,7 +226,7 @@ install_cuda12_toolkit() {
     if apt-cache show "cuda-nvcc-$ver" >/dev/null 2>&1 && \
        apt-cache show "cuda-cudart-dev-$ver" >/dev/null 2>&1 && \
        apt-cache show "libcublas-dev-$ver" >/dev/null 2>&1; then
-      info "Installing minimal CUDA ${ver//-/.} build toolkit..."
+      info "Installing minimal CUDA ${ver//-/.} build toolkit..." >&2
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         "cuda-nvcc-$ver" "cuda-cudart-dev-$ver" "libcublas-dev-$ver" >/dev/null
       toolkit="/usr/local/cuda-${ver//-/.}"
@@ -243,6 +242,7 @@ install_cuda12_toolkit() {
 
 repair_cuda_compat() {
   local driver driver_major toolkit arch jobs server bin_dir runtime_ld probe
+  local -a cmake_args
   driver="$(host_driver || true)"
   [[ "$driver" =~ ^([0-9]+)\. ]] || { fail 'Could not determine NVIDIA driver version.'; return 1; }
   driver_major="${BASH_REMATCH[1]}"
@@ -320,13 +320,12 @@ reset_runtime() {
 }
 
 main() {
-  local mode="${1:-interactive}"
+  local mode="${1:-interactive}" answer
   case "$mode" in
     -h|--help|help) usage; return 0 ;;
     --reset|reset) reset_runtime; return 0 ;;
     --check|check)
       diagnose
-      return $?
       ;;
     --fix|fix)
       diagnose || true
@@ -338,7 +337,6 @@ main() {
       if (( DIAG_NEEDS_FIX == 0 )); then return 0; fi
       echo
       if [[ -t 0 ]]; then
-        local answer
         read -r -p 'Attempt automatic CUDA compatibility repair now? [Y/n]: ' answer || true
         answer="${answer:-y}"
         [[ "$answer" =~ ^[Yy]$ ]] || return 1
