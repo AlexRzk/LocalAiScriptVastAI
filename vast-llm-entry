@@ -5,12 +5,30 @@ LIB_DIR="${VAST_LLM_LIB_DIR:-/usr/local/lib/vast-llm}"
 CORE="${VAST_LLM_CORE:-$LIB_DIR/vast-llm-core}"
 UI="${VAST_LLM_UI:-$LIB_DIR/vast-llm-ui}"
 BENCH="${VAST_LLM_BENCH:-$LIB_DIR/vast-llm-bench}"
+DOCTOR="${VAST_LLM_DOCTOR:-$LIB_DIR/vast-llm-doctor}"
 STATE_DIR="${VAST_LLM_STATE_DIR:-/data/vast-llm}"
 CURRENT_FILE="$STATE_DIR/current_profile"
+SERVER_PATH_FILE="$STATE_DIR/llama_server_path"
+RUNTIME_LD_FILE="$STATE_DIR/llama_runtime_ld_path"
 
-for f in "$CORE" "$UI" "$BENCH"; do
+for f in "$CORE" "$UI" "$BENCH" "$DOCTOR"; do
   [[ -x "$f" ]] || { printf 'ERROR: missing executable %s. Re-run install.sh.\n' "$f" >&2; exit 1; }
 done
+
+activate_repaired_runtime() {
+  local server runtime_ld
+  if [[ -s "$SERVER_PATH_FILE" ]]; then
+    server="$(cat "$SERVER_PATH_FILE")"
+    if [[ -x "$server" ]]; then
+      export LLAMA_SERVER="$server"
+      runtime_ld=""
+      [[ -s "$RUNTIME_LD_FILE" ]] && runtime_ld="$(cat "$RUNTIME_LD_FILE")"
+      export LD_LIBRARY_PATH="$(dirname "$server")${runtime_ld:+:$runtime_ld}:${LD_LIBRARY_PATH:-}"
+    fi
+  fi
+}
+
+activate_repaired_runtime
 
 c_reset='\033[0m'; c_bold='\033[1m'; c_yellow='\033[33m'
 if [[ -n "${NO_COLOR:-}" ]]; then c_reset=''; c_bold=''; c_yellow=''; fi
@@ -72,6 +90,7 @@ main_menu() {
   8) Full configuration wizard
   9) Advanced manager menu
  10) Show API key
+ 11) Doctor / CUDA repair
   0) Exit
 EOF
     read -r -p 'Choose: ' choice || return
@@ -90,6 +109,7 @@ EOF
       8) "$CORE" wizard "$cur" ;;
       9) "$CORE" menu ;;
       10) "$CORE" key ;;
+      11) "$DOCTOR" ;;
       0) return ;;
       *) warn 'Unknown choice.' ;;
     esac
@@ -103,6 +123,12 @@ Vast LLM Manager additions
 Tuning:
   vast-llm settings [profile]
   vast-llm set <setting> <value> [profile]
+
+CUDA doctor / repair:
+  vast-llm doctor
+  vast-llm doctor --check
+  vast-llm doctor --fix
+  vast-llm doctor --reset
 
 Benchmark Center:
   vast-llm benchmarks
@@ -126,6 +152,10 @@ case "${1:-}" in
     ;;
   settings|tune|quick|set|quick-help)
     exec "$UI" "$@"
+    ;;
+  doctor)
+    shift
+    exec "$DOCTOR" "$@"
     ;;
   benchmarks|benchmark-center)
     exec "$BENCH" menu
