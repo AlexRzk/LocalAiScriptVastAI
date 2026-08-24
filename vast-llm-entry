@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -u
+
+LIB_DIR="${VAST_LLM_LIB_DIR:-/usr/local/lib/vast-llm}"
+CORE="${VAST_LLM_CORE:-$LIB_DIR/vast-llm-core}"
+UI="${VAST_LLM_UI:-$LIB_DIR/vast-llm-ui}"
+BENCH="${VAST_LLM_BENCH:-$LIB_DIR/vast-llm-bench}"
+STATE_DIR="${VAST_LLM_STATE_DIR:-/data/vast-llm}"
+CURRENT_FILE="$STATE_DIR/current_profile"
+
+for f in "$CORE" "$UI" "$BENCH"; do
+  [[ -x "$f" ]] || { printf 'ERROR: missing executable %s. Re-run install.sh.\n' "$f" >&2; exit 1; }
+done
+
+c_reset='\033[0m'; c_bold='\033[1m'; c_yellow='\033[33m'
+if [[ -n "${NO_COLOR:-}" ]]; then c_reset=''; c_bold=''; c_yellow=''; fi
+warn() { printf '%b%s%b\n' "$c_yellow" "$*" "$c_reset" >&2; }
+
+current_profile() {
+  if [[ -s "$CURRENT_FILE" ]]; then cat "$CURRENT_FILE"; else printf 'default'; fi
+}
+
+sleep_tiny() { sleep "$1" 2>/dev/null || true; }
+
+splash_enabled() {
+  [[ "${VAST_LLM_NO_SPLASH:-0}" != 1 ]] || return 1
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-dumb}" != dumb ]] || return 1
+}
+
+show_splash() {
+  local reset='\033[0m' bold='\033[1m' cyan='\033[38;5;51m' blue='\033[38;5;39m' violet='\033[38;5;141m' dim='\033[2m' green='\033[38;5;82m'
+  [[ -z "${NO_COLOR:-}" ]] || { reset=''; bold=''; cyan=''; blue=''; violet=''; dim=''; green=''; }
+  printf '\033[?25l'; trap 'printf "\033[?25h"' EXIT INT TERM
+  clear 2>/dev/null || printf '\n'
+  local -a art=(
+'██╗   ██╗ █████╗ ███████╗████████╗      ██╗     ██╗     ███╗   ███╗'
+'██║   ██║██╔══██╗██╔════╝╚══██╔══╝      ██║     ██║     ████╗ ████║'
+'██║   ██║███████║███████╗   ██║         ██║     ██║     ██╔████╔██║'
+'╚██╗ ██╔╝██╔══██║╚════██║   ██║         ██║     ██║     ██║╚██╔╝██║'
+' ╚████╔╝ ██║  ██║███████║   ██║         ███████╗███████╗██║ ╚═╝ ██║'
+'  ╚═══╝  ╚═╝  ╚═╝╚══════╝   ╚═╝         ╚══════╝╚══════╝╚═╝     ╚═╝'
+  )
+  local i color
+  for ((i=0;i<${#art[@]};i++)); do
+    case $((i%3)) in 0) color="$cyan";; 1) color="$blue";; *) color="$violet";; esac
+    printf '%b%b%s%b\n' "$bold" "$color" "${art[$i]}" "$reset"
+    sleep_tiny "${VAST_LLM_SPLASH_SPEED:-0.02}"
+  done
+  printf '\n%b      Vast.ai GPU inference control plane%b\n' "$dim" "$reset"
+  printf '%b      profiles • tuning • benchmarks • multi-model%b\n\n' "$dim" "$reset"
+  local -a frames=('◐' '◓' '◑' '◒') stages=('CUDA' 'Profiles' 'Benchmark lab' 'Ready')
+  for ((i=0;i<4;i++)); do printf '\r%b%s%b  %-18s' "$cyan" "${frames[$i]}" "$reset" "${stages[$i]}"; sleep_tiny "${VAST_LLM_SPLASH_STAGE_SPEED:-0.07}"; done
+  printf '\r%b✓%b  %-18s\n\n' "$green" "$reset" 'Control plane online'
+  printf '\033[?25h'; trap - EXIT INT TERM
+}
+
+main_menu() {
+  local cur choice np
+  while true; do
+    cur="$(current_profile)"
+    echo
+    printf '%bVast.ai LLM Manager%b — current: %s\n' "$c_bold" "$c_reset" "$cur"
+    cat <<'EOF'
+  1) Quick settings / performance tuning
+  2) Status
+  3) Start
+  4) Stop
+  5) Restart
+  6) Benchmark Center
+  7) Profiles / switch profile
+  8) Full configuration wizard
+  9) Advanced manager menu
+ 10) Show API key
+  0) Exit
+EOF
+    read -r -p 'Choose: ' choice || return
+    case "$choice" in
+      1) "$UI" settings "$cur" ;;
+      2) "$CORE" status "$cur" ;;
+      3) "$CORE" start "$cur" ;;
+      4) "$CORE" stop "$cur" ;;
+      5) "$CORE" restart "$cur" ;;
+      6) "$BENCH" menu ;;
+      7)
+        "$CORE" profiles
+        read -r -p 'Profile to use (blank = keep current): ' np || true
+        [[ -z "$np" ]] || "$CORE" use "$np"
+        ;;
+      8) "$CORE" wizard "$cur" ;;
+      9) "$CORE" menu ;;
+      10) "$CORE" key ;;
+      0) return ;;
+      *) warn 'Unknown choice.' ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'EOF'
+Vast LLM Manager additions
+
+Tuning:
+  vast-llm settings [profile]
+  vast-llm set <setting> <value> [profile]
+
+Benchmark Center:
+  vast-llm benchmarks
+  vast-llm bench-suite [profile] [quick|full]
+  vast-llm bench-compare <profileA> <profileB> [quick|full]
+  vast-llm bench-speed [profile] [replica] [runs]
+  vast-llm bench-quality [profile] [replica]
+  vast-llm bench-needle [profile] [words] [replica]
+  vast-llm bench-history
+  vast-llm bench-custom [profile] [replica]
+
+All ordinary commands (start, stop, restart, status, wizard, profiles, key, etc.)
+are forwarded to the core manager.
+EOF
+}
+
+case "${1:-}" in
+  ""|menu)
+    splash_enabled && show_splash
+    main_menu
+    ;;
+  settings|tune|quick|set|quick-help)
+    exec "$UI" "$@"
+    ;;
+  benchmarks|benchmark-center)
+    exec "$BENCH" menu
+    ;;
+  bench-suite)
+    shift; exec "$BENCH" suite "$@"
+    ;;
+  bench-compare)
+    shift; exec "$BENCH" compare "$@"
+    ;;
+  bench-speed)
+    shift; exec "$BENCH" speed "$@"
+    ;;
+  bench-quality)
+    shift; exec "$BENCH" quality "$@"
+    ;;
+  bench-needle)
+    shift; exec "$BENCH" needle "$@"
+    ;;
+  bench-history)
+    exec "$BENCH" history
+    ;;
+  bench-custom)
+    shift; exec "$BENCH" custom "$@"
+    ;;
+  help|-h|--help)
+    usage
+    echo
+    "$CORE" help
+    ;;
+  *)
+    exec "$CORE" "$@"
+    ;;
+esac
