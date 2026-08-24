@@ -28,12 +28,13 @@ Usage:
   vast-llm doctor --fix       Diagnose and automatically repair CUDA compatibility
   vast-llm doctor --reset     Forget the doctor-installed llama.cpp runtime
 
-The repair is intended for cases such as:
+The repair handles cases such as:
   ggml_cuda_init: failed to initialize CUDA: forward compatibility was attempted on non supported HW
   warning: no usable GPU found, --gpu-layers option will be ignored
 
-Repair builds a current llama.cpp against a CUDA 12.x toolkit, stores it under
-/data/vast-llm/runtime, and makes future `vast-llm start/restart` calls use it.
+It first tries to recover an already-built CUDA 12 llama.cpp with the real host
+NVIDIA driver library (bypassing cuda-compat/stub libraries). Only if that fails
+does it build a new CUDA 12.x llama.cpp under /data/vast-llm/runtime.
 EOF
 }
 
@@ -72,7 +73,7 @@ host_compute_arch() {
 }
 
 runtime_ld_path() {
-  if [[ -s "$RUNTIME_LD_FILE" ]]; then cat "$RUNTIME_LD_FILE"; fi
+  [[ -s "$RUNTIME_LD_FILE" ]] && cat "$RUNTIME_LD_FILE"
 }
 
 preferred_server() {
@@ -90,10 +91,88 @@ preferred_server() {
   return 1
 }
 
+is_compat_or_stub_path() {
+  local p="${1:-}"
+  [[ "$p" == *'/compat'* || "$p" == *'/stubs'* ]]
+}
+
+find_native_libcuda_dir() {
+  local p resolved
+  local -a candidates=(
+    /usr/local/nvidia/lib64/libcuda.so.1
+    /usr/lib/x86_64-linux-gnu/libcuda.so.1
+    /lib/x86_64-linux-gnu/libcuda.so.1
+    /usr/lib64/libcuda.so.1
+  )
+
+  for p in "${candidates[@]}"; do
+    [[ -e "$p" ]] || continue
+    resolved="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+    is_compat_or_stub_path "$resolved" && continue
+    dirname "$p"
+    return 0
+  done
+
+  if command -v ldconfig >/dev/null 2>&1; then
+    while IFS= read -r p; do
+      [[ -e "$p" ]] || continue
+      resolved="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+      is_compat_or_stub_path "$resolved" && continue
+      dirname "$p"
+      return 0
+    done < <(ldconfig -p 2>/dev/null | awk '/libcuda\.so\.1/{print $NF}')
+  fi
+
+  return 1
+}
+
+compat_paths_in_environment() {
+  local p
+  IFS=':' read -r -a _ld_parts <<< "${LD_LIBRARY_PATH:-}"
+  for p in "${_ld_parts[@]}"; do
+    [[ -n "$p" ]] || continue
+    is_compat_or_stub_path "$p" && printf '%s\n' "$p"
+  done
+}
+
+clean_inherited_ld_path() {
+  local p out=''
+  local -a parts
+  IFS=':' read -r -a parts <<< "${LD_LIBRARY_PATH:-}"
+  for p in "${parts[@]}"; do
+    [[ -n "$p" ]] || continue
+    is_compat_or_stub_path "$p" && continue
+    [[ "$p" == /app ]] && continue
+    case ":$out:" in *":$p:"*) continue ;; esac
+    out="${out:+$out:}$p"
+  done
+  printf '%s' "$out"
+}
+
+compose_runtime_ld() {
+  local server="$1" toolkit="${2:-}" native_driver inherited out
+  native_driver="$(find_native_libcuda_dir || true)"
+  inherited="$(clean_inherited_ld_path)"
+  out=''
+
+  [[ -n "$native_driver" ]] && out="$native_driver"
+  out="${out:+$out:}$(dirname "$server")"
+  if [[ -n "$toolkit" ]]; then
+    [[ -d "$toolkit/lib64" ]] && out="$out:$toolkit/lib64"
+    [[ -d "$toolkit/targets/x86_64-linux/lib" ]] && out="$out:$toolkit/targets/x86_64-linux/lib"
+  fi
+  [[ -n "$inherited" ]] && out="$out:$inherited"
+  printf '%s' "$out"
+}
+
 server_ld_path() {
-  local server="$1" extra
-  extra="$(runtime_ld_path || true)"
-  printf '%s' "$(dirname "$server")${extra:+:$extra}:/app:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+  local server="$1" saved
+  if [[ -s "$SERVER_PATH_FILE" && -s "$RUNTIME_LD_FILE" && "$(cat "$SERVER_PATH_FILE")" == "$server" ]]; then
+    saved="$(cat "$RUNTIME_LD_FILE")"
+    printf '%s' "$saved"
+    return
+  fi
+  printf '%s' "$(dirname "$server"):/app:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 }
 
 server_version() {
@@ -102,10 +181,21 @@ server_version() {
   LD_LIBRARY_PATH="$ld" "$server" --version 2>&1 || true
 }
 
+probe_with_ld() {
+  local server="$1" ld="$2"
+  LD_PRELOAD= LD_LIBRARY_PATH="$ld" "$server" --list-devices 2>&1 || true
+}
+
 probe_cuda() {
   local server="$1" ld
   ld="$(server_ld_path "$server")"
-  LD_LIBRARY_PATH="$ld" "$server" --list-devices 2>&1 || true
+  probe_with_ld "$server" "$ld"
+}
+
+probe_ok() {
+  local probe="$1"
+  ! grep -qiE 'forward compatibility was attempted on non supported HW|failed to initialize CUDA|no usable GPU|CUDA driver version is insufficient' <<<"$probe" && \
+    grep -qiE 'CUDA[0-9]|NVIDIA.*GeForce|NVIDIA.*RTX|NVIDIA.*A[0-9]|NVIDIA.*H[0-9]|NVIDIA.*L[0-9]' <<<"$probe"
 }
 
 recent_cuda_log_errors() {
@@ -123,7 +213,7 @@ DIAG_SERVER=''
 DIAG_PROBE=''
 
 diagnose() {
-  local driver cuda gpu version log_errors driver_major
+  local driver cuda gpu version log_errors driver_major compat native_driver
   DIAG_NEEDS_FIX=0
   DIAG_REASON=''
 
@@ -138,10 +228,18 @@ diagnose() {
   driver="$(host_driver || true)"
   cuda="$(host_cuda || true)"
   gpu="$(host_gpu_name || true)"
+  native_driver="$(find_native_libcuda_dir || true)"
   printf 'GPU:              %s\n' "${gpu:-unknown}"
   printf 'Host driver:      %s\n' "${driver:-unknown}"
   printf 'Host max CUDA:    %s\n' "${cuda:-unknown}"
   printf 'Compute target:   %s\n' "$(host_compute_arch)"
+  printf 'Native libcuda:   %s\n' "${native_driver:-NOT FOUND}"
+
+  compat="$(compat_paths_in_environment || true)"
+  if [[ -n "$compat" ]]; then
+    warn 'Forward-compat/stub paths are present in LD_LIBRARY_PATH:'
+    printf '%s\n' "$compat" | sed 's/^/  /' >&2
+  fi
 
   echo
   printf '%b== llama.cpp ==%b\n' "$c_bold" "$c_reset"
@@ -156,22 +254,12 @@ diagnose() {
   version="$(server_version "$DIAG_SERVER")"
   printf '%s\n' "$version" | sed 's/^/  /'
 
-  if ldd "$DIAG_SERVER" 2>/dev/null | grep -q 'not found'; then
-    warn 'Shared-library problems:'
-    ldd "$DIAG_SERVER" 2>/dev/null | grep 'not found' | sed 's/^/  /' || true
-    DIAG_NEEDS_FIX=1
-    DIAG_REASON='llama-server has unresolved shared libraries.'
-  fi
-
   echo
   printf '%b== CUDA backend probe ==%b\n' "$c_bold" "$c_reset"
   DIAG_PROBE="$(probe_cuda "$DIAG_SERVER")"
   printf '%s\n' "$DIAG_PROBE" | sed 's/^/  /'
 
-  if grep -qiE 'forward compatibility was attempted on non supported HW|failed to initialize CUDA|no usable GPU' <<<"$DIAG_PROBE"; then
-    DIAG_NEEDS_FIX=1
-    DIAG_REASON='The llama.cpp CUDA runtime is incompatible with this host driver.'
-  elif ! grep -qiE 'CUDA[0-9]|NVIDIA.*GPU|NVIDIA.*GeForce|NVIDIA.*RTX|NVIDIA.*A[0-9]|NVIDIA.*H[0-9]|NVIDIA.*L[0-9]' <<<"$DIAG_PROBE"; then
+  if ! probe_ok "$DIAG_PROBE"; then
     DIAG_NEEDS_FIX=1
     DIAG_REASON='llama.cpp did not expose a usable CUDA device.'
   fi
@@ -197,36 +285,94 @@ diagnose() {
   if [[ -n "$driver" && "$driver" =~ ^([0-9]+)\. ]]; then
     driver_major="${BASH_REMATCH[1]}"
     if (( driver_major < 525 )); then
-      warn 'This host driver is older than the CUDA 12.x compatibility floor used by the repair.'
+      warn 'This host driver is too old for the automatic CUDA 12.x repair.'
     elif (( driver_major < 580 )); then
-      info 'Recommended repair: use a CUDA 12.x llama.cpp build instead of the image CUDA 13.x build.'
+      info 'Repair strategy: bypass cuda-compat and use a CUDA 12.x llama.cpp with the host libcuda.'
     fi
   fi
   return 1
 }
 
-find_cuda12_toolkit() {
-  local d
-  while IFS= read -r d; do
-    if [[ -x "$d/bin/nvcc" ]]; then printf '%s' "$d"; return 0; fi
-  done < <(find /usr/local -maxdepth 1 -type d -name 'cuda-12*' 2>/dev/null | sort -Vr)
+build_toolkit_from_cache() {
+  local cache="$BUILD_DIR/CMakeCache.txt" compiler
+  [[ -f "$cache" ]] || return 1
+  compiler="$(sed -n 's#^CMAKE_CUDA_COMPILER:FILEPATH=\(.*\)/bin/nvcc#\1#p' "$cache" | head -n1)"
+  [[ -n "$compiler" && -x "$compiler/bin/nvcc" ]] || return 1
+  printf '%s' "$compiler"
+}
+
+save_runtime() {
+  local server="$1" runtime_ld="$2" toolkit="${3:-unknown}"
+  printf '%s\n' "$server" > "$SERVER_PATH_FILE"
+  printf '%s\n' "$runtime_ld" > "$RUNTIME_LD_FILE"
+  chmod 600 "$SERVER_PATH_FILE" "$RUNTIME_LD_FILE"
+  echo
+  ok 'CUDA compatibility repair succeeded.'
+  printf 'Preferred llama-server: %s\n' "$server"
+  printf 'Toolkit:                %s\n' "$toolkit"
+  printf 'Runtime LD path:         %s\n' "$runtime_ld"
+  printf 'Runtime saved under:     %s\n' "$RUNTIME_DIR"
+  echo
+  info "Run: vast-llm restart $(current_profile)"
+}
+
+try_existing_repair_build() {
+  local server="$BUILD_DIR/bin/llama-server" toolkit runtime_ld probe
+  [[ -x "$server" ]] || return 1
+  toolkit="$(build_toolkit_from_cache || true)"
+  runtime_ld="$(compose_runtime_ld "$server" "$toolkit")"
+  info 'Found the previous doctor build. Retesting it with cuda-compat/stubs removed...'
+  printf 'Runtime LD path: %s\n' "$runtime_ld"
+  probe="$(probe_with_ld "$server" "$runtime_ld")"
+  printf '%s\n' "$probe" | sed 's/^/  /'
+  if probe_ok "$probe"; then
+    save_runtime "$server" "$runtime_ld" "${toolkit:-existing CUDA 12.x build}"
+    return 0
+  fi
+  warn 'Existing CUDA 12 build still failed with a clean host-driver runtime; rebuilding with a host-appropriate toolkit.'
   return 1
 }
 
-install_cuda12_toolkit() {
-  local ver toolkit
-  command -v apt-get >/dev/null 2>&1 || { fail 'apt-get is unavailable; cannot install a CUDA 12 toolkit automatically.'; return 1; }
-  [[ "$(id -u)" == 0 ]] || { fail 'Automatic CUDA toolkit installation requires root on the Vast instance.'; return 1; }
+preferred_cuda12_versions() {
+  local driver_major="$1"
+  if (( driver_major >= 575 )); then
+    printf '%s\n' 12-9 12-8 12-6 12-4 12-2
+  elif (( driver_major >= 570 )); then
+    printf '%s\n' 12-8 12-6 12-4 12-2
+  elif (( driver_major >= 560 )); then
+    printf '%s\n' 12-6 12-4 12-2
+  elif (( driver_major >= 550 )); then
+    printf '%s\n' 12-4 12-2
+  else
+    printf '%s\n' 12-2 12-1 12-4
+  fi
+}
+
+find_compatible_toolkit() {
+  local driver_major="$1" ver toolkit
+  while IFS= read -r ver; do
+    toolkit="/usr/local/cuda-${ver//-/.}"
+    [[ -x "$toolkit/bin/nvcc" ]] || continue
+    printf '%s' "$toolkit"
+    return 0
+  done < <(preferred_cuda12_versions "$driver_major")
+  return 1
+}
+
+install_compatible_toolkit() {
+  local driver_major="$1" ver toolkit
+  command -v apt-get >/dev/null 2>&1 || { fail 'apt-get is unavailable; cannot install CUDA build tools.'; return 1; }
+  [[ "$(id -u)" == 0 ]] || { fail 'Automatic CUDA toolkit installation requires root.'; return 1; }
 
   info 'Installing build dependencies...' >&2
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git cmake build-essential ca-certificates >/dev/null
 
-  for ver in 12-8 12-6 12-5 12-4; do
+  while IFS= read -r ver; do
     if apt-cache show "cuda-nvcc-$ver" >/dev/null 2>&1 && \
        apt-cache show "cuda-cudart-dev-$ver" >/dev/null 2>&1 && \
        apt-cache show "libcublas-dev-$ver" >/dev/null 2>&1; then
-      info "Installing minimal CUDA ${ver//-/.} build toolkit..." >&2
+      info "Installing CUDA ${ver//-/.} build toolkit for driver branch $driver_major..." >&2
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         "cuda-nvcc-$ver" "cuda-cudart-dev-$ver" "libcublas-dev-$ver" >/dev/null
       toolkit="/usr/local/cuda-${ver//-/.}"
@@ -234,34 +380,39 @@ install_cuda12_toolkit() {
       printf '%s' "$toolkit"
       return 0
     fi
-  done
+  done < <(preferred_cuda12_versions "$driver_major")
 
-  fail 'No supported CUDA 12.x toolkit packages were found in the configured NVIDIA apt repository.'
+  fail 'No host-appropriate CUDA 12.x toolkit package was available from the configured NVIDIA repository.'
   return 1
 }
 
 repair_cuda_compat() {
-  local driver driver_major toolkit arch jobs server bin_dir runtime_ld probe
+  local driver driver_major toolkit arch jobs server runtime_ld probe
   local -a cmake_args
+
   driver="$(host_driver || true)"
   [[ "$driver" =~ ^([0-9]+)\. ]] || { fail 'Could not determine NVIDIA driver version.'; return 1; }
   driver_major="${BASH_REMATCH[1]}"
   if (( driver_major < 525 )); then
-    fail "Driver $driver is too old for the automatic CUDA 12.x repair. Rent a newer host or update the host driver."
+    fail "Driver $driver is too old for this repair. Rent a newer host or update the host driver."
     return 1
   fi
 
-  if toolkit="$(find_cuda12_toolkit)"; then
-    ok "Found compatible toolkit: $toolkit"
+  if try_existing_repair_build; then
+    return 0
+  fi
+
+  if toolkit="$(find_compatible_toolkit "$driver_major")"; then
+    ok "Found host-appropriate toolkit: $toolkit"
   else
-    toolkit="$(install_cuda12_toolkit)" || return 1
-    ok "Installed compatible toolkit: $toolkit"
+    toolkit="$(install_compatible_toolkit "$driver_major")" || return 1
+    ok "Installed host-appropriate toolkit: $toolkit"
   fi
 
   arch="$(host_compute_arch)"
-  info "Building current llama.cpp for CUDA 12.x (GPU target: $arch)..."
-
+  info "Building current llama.cpp with $toolkit (GPU target: $arch)..."
   mkdir -p "$RUNTIME_DIR"
+
   if [[ -d "$SRC_DIR/.git" ]]; then
     git -C "$SRC_DIR" fetch --depth 1 origin master
     git -C "$SRC_DIR" reset --hard FETCH_HEAD >/dev/null
@@ -289,29 +440,19 @@ repair_cuda_compat() {
 
   server="$BUILD_DIR/bin/llama-server"
   [[ -x "$server" ]] || { fail "Build completed but $server does not exist."; return 1; }
-  bin_dir="$(dirname "$server")"
-  runtime_ld="$bin_dir:$toolkit/lib64:$toolkit/targets/x86_64-linux/lib"
+  runtime_ld="$(compose_runtime_ld "$server" "$toolkit")"
 
-  info 'Testing the repaired CUDA backend...'
-  probe="$(LD_LIBRARY_PATH="$runtime_ld:${LD_LIBRARY_PATH:-}" "$server" --list-devices 2>&1 || true)"
+  info 'Testing repaired CUDA backend with the native host libcuda and no compat/stub paths...'
+  printf 'Runtime LD path: %s\n' "$runtime_ld"
+  probe="$(probe_with_ld "$server" "$runtime_ld")"
   printf '%s\n' "$probe" | sed 's/^/  /'
-  if grep -qiE 'forward compatibility was attempted on non supported HW|failed to initialize CUDA|no usable GPU' <<<"$probe" || \
-     ! grep -qiE 'CUDA[0-9]|NVIDIA.*GeForce|NVIDIA.*RTX|NVIDIA.*A[0-9]|NVIDIA.*H[0-9]|NVIDIA.*L[0-9]' <<<"$probe"; then
-    fail 'The rebuilt llama.cpp still cannot expose a CUDA GPU. The host/container has a deeper NVIDIA runtime problem.'
+  if ! probe_ok "$probe"; then
+    fail 'The rebuilt llama.cpp still cannot expose CUDA with the native host driver library.'
+    warn 'This is now likely a real host NVIDIA runtime problem rather than a CUDA toolkit-version problem.'
     return 1
   fi
 
-  printf '%s\n' "$server" > "$SERVER_PATH_FILE"
-  printf '%s\n' "$runtime_ld" > "$RUNTIME_LD_FILE"
-  chmod 600 "$SERVER_PATH_FILE" "$RUNTIME_LD_FILE"
-
-  echo
-  ok 'CUDA compatibility repair succeeded.'
-  printf 'Preferred llama-server: %s\n' "$server"
-  printf 'Toolkit:                %s\n' "$toolkit"
-  printf 'Runtime saved under:     %s\n' "$RUNTIME_DIR"
-  echo
-  info "Run: vast-llm restart $(current_profile)"
+  save_runtime "$server" "$runtime_ld" "$toolkit"
 }
 
 reset_runtime() {
@@ -324,9 +465,7 @@ main() {
   case "$mode" in
     -h|--help|help) usage; return 0 ;;
     --reset|reset) reset_runtime; return 0 ;;
-    --check|check)
-      diagnose
-      ;;
+    --check|check) diagnose ;;
     --fix|fix)
       diagnose || true
       if (( DIAG_NEEDS_FIX == 0 )); then return 0; fi
