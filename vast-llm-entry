@@ -23,7 +23,12 @@ activate_repaired_runtime() {
       export LLAMA_SERVER="$server"
       runtime_ld=""
       [[ -s "$RUNTIME_LD_FILE" ]] && runtime_ld="$(cat "$RUNTIME_LD_FILE")"
-      export LD_LIBRARY_PATH="$(dirname "$server")${runtime_ld:+:$runtime_ld}:${LD_LIBRARY_PATH:-}"
+      if [[ -n "$runtime_ld" ]]; then
+        export LD_LIBRARY_PATH="$runtime_ld"
+      else
+        export LD_LIBRARY_PATH="$(dirname "$server")"
+      fi
+      export VAST_LLM_REPAIRED_RUNTIME=1
     fi
   fi
 }
