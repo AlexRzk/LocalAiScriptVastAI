@@ -13,55 +13,104 @@ The menu provides:
 1. Quick benchmark suite
 2. Full benchmark suite
 3. Raw generation speed (3 runs)
-4. Reasoning + coding + tool quality
+4. Correctness + agentic checks
 5. Long-context needle test
 6. Compare two profiles — quick
 7. Compare two profiles — full
 8. Benchmark history
 9. Custom prompt benchmark
 
+## Benchmark v2
+
+Benchmark v2 intentionally does **not** present one synthetic `quality %` as if it were a general intelligence score. The summary separates four different things:
+
+- **Performance** — decode throughput, long-prompt prefill throughput and MTP acceptance
+- **Correctness** — deterministic reasoning and code-understanding checks
+- **Agentic/API** — structured JSON and OpenAI-compatible tool-call behavior
+- **Context retrieval** — needle retrieval at moderate and, in full mode, larger context sizes
+
+A `Checks passed` total is still stored for regression tracking. Legacy `quality_*` JSON keys remain as aliases for compatibility with older result consumers, but the CLI no longer labels that value as model quality.
+
 ## What the suite measures
 
 ### Generation speed
 
-A fixed 512-token-cap technical prompt. The suite records:
+Each run uses a 512-token-cap technical generation prompt. A unique nonce is placed at the beginning of every prompt so llama.cpp prefix-cache reuse cannot make later runs artificially cheap.
 
+The suite records:
+
+- output tokens
+- decode time
 - generation tokens/s
-- prompt tokens/s
+- prompt tokens and prompt-processing time
 - wall-clock time
-- generated tokens
 - MTP drafted/accepted tokens
 - MTP acceptance ratio
 
-The quick suite runs this once. The full suite runs it three times and averages the results.
+For multi-run tests, throughput is computed from aggregate token/time totals rather than taking a simple arithmetic mean of per-request rates.
 
-### Prompt prefill
+The quick suite runs this once. The full suite runs it three times.
 
-A deterministic synthetic technical corpus tests prompt-processing throughput. This is useful for OpenCode because large system prompts, tool schemas and repository context can make prefill latency important even when decode speed is high.
+### Long-prompt prefill
 
-### Reasoning
+A synthetic technical corpus measures prompt-processing throughput. A unique nonce at the start defeats prefix-cache reuse.
+
+The benchmark summary reports **the prompt tokens/s from this dedicated long-prompt prefill request**. It does not use the tiny prompt-processing rate from the generation-speed request.
+
+This is especially relevant for OpenCode because large system prompts, tool schemas and repository context can make prefill latency important even when decode speed is high.
+
+### Correctness: reasoning
 
 Four deterministic arithmetic/logic questions with known answers are automatically scored.
 
-### Coding
+For these deterministic checks, the request asks llama.cpp to disable thinking using `reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking=false`. The output allowance is also large enough that a model which ignores that hint is less likely to be cut off before its final answer.
 
-Four deterministic code-understanding/debugging questions are automatically scored, including Python and JavaScript execution reasoning and recognition of the mutable-default-argument bug.
+Only final `message.content` is scored. `reasoning_content` is retained as a diagnostic excerpt but cannot accidentally make a wrong final answer pass.
 
-### Instruction following
+### Correctness: coding
+
+Four deterministic code-understanding/debugging checks cover Python and JavaScript execution reasoning plus recognition of the mutable-default-argument bug.
+
+Exact-output questions are normalized and compared exactly instead of passing merely because the expected substring appeared somewhere in hidden reasoning. The mutable-default bug check intentionally uses a phrase-containment match because several short correct descriptions are reasonable.
+
+### Agentic/API: instruction following
 
 The model must return an exact JSON structure. The result is parsed and validated with `jq`.
 
-### Tool calling
+### Agentic/API: tool calling
 
-The server is given a real OpenAI-compatible function schema and instructed to call `get_weather` for Paris. The test verifies that a structured tool call is emitted with the expected function and argument.
+The server is given an OpenAI-compatible function schema and instructed to call `get_weather` for Paris. The test verifies that a structured tool call is emitted with the expected function and argument.
 
-This is particularly useful for comparing models intended for OpenCode or other agentic clients.
+A failure here should be interpreted as an **agent/template/API compatibility** failure, not automatically as low model intelligence. Tool behavior can depend on the model chat template and llama.cpp integration.
 
-### Long-context retrieval
+### Context retrieval
 
-A random secret token is inserted into a large synthetic corpus. The model must retrieve it. The benchmark also records prompt-processing metrics for that request.
+A random secret token is inserted into a large synthetic corpus. The model must retrieve it. A unique prompt nonce prevents accidental prefix-cache reuse.
 
 The full suite adds a larger long-context test when the running llama.cpp context is at least 65,536 tokens.
+
+## Result summary
+
+A v2 result looks conceptually like:
+
+```text
+Benchmark result
+  Profile:             qwen36
+  Model:               example.gguf
+  Runtime ctx:         120064
+
+  Performance
+    Generation:        43.2 tok/s
+    Long prefill:      742.6 tok/s
+    MTP acceptance:    85.4%
+
+  Correctness:         7/8
+  Agentic/API:         2/2
+  Context retrieval:   2/2
+  Checks passed:       11/12 (91.7%)
+```
+
+Do not interpret `Checks passed` as an academic or general-intelligence percentage. It is a compact regression-suite result.
 
 ## Run suites from the CLI
 
@@ -98,7 +147,7 @@ or:
 vast-llm bench-compare qwen38 qwen36 full
 ```
 
-The comparison table includes runtime context, automatic quality score, generation tokens/s, prompt tokens/s and MTP acceptance.
+The comparison table reports runtime context, correctness, agentic/API checks, context retrieval, generation throughput, dedicated long-prompt prefill throughput and MTP acceptance.
 
 ## Individual tests
 
@@ -108,11 +157,13 @@ Three-run speed benchmark:
 vast-llm bench-speed qwen38 0 3
 ```
 
-Quality tests only:
+Correctness + agentic checks:
 
 ```bash
 vast-llm bench-quality qwen38
 ```
+
+The command name `bench-quality` is retained for CLI compatibility even though its output is now split into correctness and agentic categories.
 
 Needle test with about 20,000 input words:
 
@@ -140,11 +191,11 @@ Show recent runs:
 vast-llm bench-history
 ```
 
-Each result saves the model/profile configuration alongside its scores, including context, KV types, Flash Attention, MTP settings, reasoning mode and a GPU snapshot. This makes results useful when tuning one parameter at a time.
+New results contain `benchmark_schema_version: 2`. Legacy `quality_score`, `quality_max` and `quality_pct` fields remain present as aliases of the regression check total so older scripts do not immediately break.
 
 ## Recommended tuning workflow
 
-Keep the model and prompt suite fixed and change one variable at a time:
+Keep the model and test suite fixed and change one inference variable at a time:
 
 ```bash
 vast-llm set mtp-draft 2 qwen38
@@ -160,8 +211,4 @@ vast-llm restart qwen38
 vast-llm bench-suite qwen38 quick
 ```
 
-Use the full suite on the most promising configurations to reduce noise and test long-context behavior.
-
-## Important interpretation note
-
-The automatic quality score is a small regression suite, not a general intelligence benchmark. It is designed to catch practical differences in reasoning, code comprehension, instruction following, tool calling and context retrieval while tuning local models. For serious model selection, combine it with real OpenCode tasks from your own projects.
+Use the full suite on the most promising configurations to reduce noise and test long-context behavior. For serious model selection, combine these regression checks with real OpenCode tasks from your own projects.
